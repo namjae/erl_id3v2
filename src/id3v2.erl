@@ -7,11 +7,83 @@
 %%%-------------------------------------------------------------------
 -module(id3v2).
 
--export([read_file/1, read/1, test/0]).
+-export([read_file/1, read/1, test/0, read_bin/1]).
 
 -define(DBG(Term), io:format("~p: ~p~n", [self(), Term])).
 -define(GV(E, P), proplists:get_value(E, P)).
 
+read_bin(Bin) when is_binary(Bin) ->
+    Head = binary:part(Bin, {0, 10}),
+    case read_v2_header(Head) of
+        {ok, Props} ->
+            read_v2_bin(binary:part(Bin, {10, byte_size(Bin) - 10}), Props);
+        not_found ->
+            Tail = binary:part(Bin,{byte_size(Bin), -128}),
+            case read_v1_header(Tail) of
+                {ok, Props} ->
+                    read_v1_bin(binary:part(Bin,{byte_size(Bin), -355}), Props);
+                not_found ->
+                    not_found
+            end
+    end.
+
+%% we starts at +10
+read_v2_bin(Bin, Props) when is_binary(Bin) ->
+    Version = ?GV(version, Props),
+    read_v2_bin(Version, Bin, Props).
+
+read_v2_bin({2, 2, _}, Bin, Props) when is_binary(Bin) ->
+    Header = binary:part(Bin, {0, ?GV(size, Props)}),
+    Frames = read_next_frame_22(Header, []),
+    {ok, Frames};
+read_v2_bin({2, 3, _}, Bin, Props) when is_binary(Bin) ->
+    Header = binary:part(Bin, {0, ?GV(size, Props)}),
+    Header2 = skip_v2_extended_header(Header, Props),
+    Frames = read_next_frame_23(Header2, []),
+    {ok, Frames};
+read_v2_bin({2, 4, _}, Bin, Props) when is_binary(Bin) ->
+    Header = binary:part(Bin, {0, ?GV(size, Props)}),
+    Header2 = skip_v2_extended_header(Header, Props),
+    Frames = read_next_frame_24(Header2, []),
+    {ok, Frames}.
+
+%% we need last 355 bytes(aka, -355)
+read_v1_bin(Bin, _Props) when is_binary(Bin) ->
+    case binary:part(Bin, {0, 227}) of
+        <<"TAG+", TitleExt:60/binary, ArtistExt:60/binary, AlbumExt:60/binary,
+         _Speed:8/integer, Genre:30/binary, _StartTime:6/binary, _EndTime:6/binary>>
+         -> ok;
+        _Other ->
+            {TitleExt, ArtistExt, AlbumExt, _Speed, Genre, _StartTime, _EndTime} =
+                {<<"">>, <<"">>, <<"">>, 0, <<"">>, <<"">>, <<"">>}
+    end,
+
+    %% Header = binary:part(Bin, {byte_size(Bin), -128}),
+    Header = binary:part(Bin, {227, 128}),
+    <<"TAG", Title:30/binary, Artist:30/binary, Album:30/binary, Year:4/binary,
+     CommentAndTrack:30/binary, GenreNum:8/integer>> = Header,
+
+    case CommentAndTrack of
+        <<Comment:28/binary, 0:8, Track:8/integer>> when Track > 0 -> ok; % v1
+        _ -> Comment = CommentAndTrack, Track=0 % v1.1
+    end,
+
+    CB = fun(B1, B2) ->
+                 BinStr = erlang:list_to_binary([strip_nulls(B1, 0), strip_nulls(B2, 0)]),
+                 unicode:characters_to_binary(string:strip(binary_to_list(BinStr)), latin1)
+         end,
+
+    GenreStr = case Genre of
+                   <<"">> -> v1genre(GenreNum);
+                   _ -> Genre
+               end,
+
+    Frames = [{tit2, CB(Title, TitleExt)}, {tpe1, CB(Artist, ArtistExt)},
+              {talb, CB(Album, AlbumExt)},
+              {tdrc, Year}, {comm, Comment}, {trck, Track},
+              {tcon, GenreStr}],
+              %{speed, Speed}, {startTime, StartTime}, {endTime, EndTime}],
+    {ok, Frames}.
 
 read_file(Filename) ->
     case file:open(Filename, [read, raw, binary]) of
@@ -468,3 +540,23 @@ read_files([], Total, Fail) ->
 %% <0.1.0>: {total,18}
 %% <0.1.0>: {fail,0}
 %% <0.1.0>: {time,0.01496}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% unit tests
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% -define(COMPARE_TEST_PAT, "/home/dhpark/prjs/mz/ff-proto-supra/deps/cp_music_mz/test/mp3s/*.mp3").
+-define(COMPARE_TEST_PAT, "/data/441cbf24-b58d-4390-88e2-d629a494c108/mp3/tmp/__E-POP/*.mp3").
+
+%% expected values are info from file
+file_and_bin_compare_test_() ->
+    Paths = filelib:wildcard(?COMPARE_TEST_PAT),
+    [?_assertEqual(id3v2:read_file(Path), id3v2:read_bin(to_bin(Path))) || Path <- Paths].
+
+to_bin(Path) when is_list(Path) ->
+    {ok, Bin} = file:read_file(Path),
+    Bin.
+
+-endif.                                         % end of TEST
